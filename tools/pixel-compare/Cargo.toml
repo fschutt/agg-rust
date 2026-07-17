@@ -9,5 +9,5 @@ name = "pixel-compare"
 path = "src/main.rs"
 
 [dependencies]
-agg-rust = { path = "../.." }
+agg-rust = { package = "agg-rust-azul", path = "../.." }
 agg-wasm = { path = "../../demo/wasm" }
