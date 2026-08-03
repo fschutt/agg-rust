@@ -1,11 +1,11 @@
 [package]
-name = "agg-rust"
-version = "1.0.2"
+name = "agg-rust-azul"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.70"
 license = "BSD-3-Clause"
-description = "Pure Rust port of Anti-Grain Geometry (AGG) 2.6 - high quality 2D vector graphics rendering"
-repository = "https://github.com/larsbrubaker/agg-rust"
+description = "Pure Rust port of Anti-Grain Geometry (AGG) 2.6 - high quality 2D vector graphics rendering (azul fork)"
+repository = "https://github.com/fschutt/agg-rust"
 homepage = "https://larsbrubaker.github.io/agg-rust/"
 documentation = "https://docs.rs/agg-rust"
 keywords = ["graphics", "rendering", "anti-aliasing", "2d", "vector"]

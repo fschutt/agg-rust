@@ -383,6 +383,393 @@ impl<'a> PixelFormat for PixfmtRgba32Lcd<'a> {
 }
 
 // ============================================================================
+// Linear-light (gamma-correct) LCD blending
+// ============================================================================
+
+/// sRGB <-> linear-light lookup tables (13-bit linear precision).
+///
+/// `to_linear[srgb8]` gives linear light scaled to 0..=8160 (255 * 32);
+/// `to_srgb[linear13]` inverts it. Built once on first use. The transfer
+/// function is plain sRGB today; swapping these tables is the designed
+/// extension point for other transfer curves (e.g. Display-P3, which
+/// shares the sRGB curve but differs in primaries, or PQ).
+pub struct SrgbLuts {
+    to_linear: [u16; 256],
+    to_srgb: Vec<u8>,
+}
+
+const LINEAR_MAX: u32 = 8160; // 255 * 32
+
+impl SrgbLuts {
+    fn build() -> Self {
+        let mut to_linear = [0u16; 256];
+        for (i, e) in to_linear.iter_mut().enumerate() {
+            let c = i as f64 / 255.0;
+            let lin = if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            };
+            *e = (lin * f64::from(LINEAR_MAX)).round() as u16;
+        }
+        let mut to_srgb = vec![0u8; (LINEAR_MAX + 1) as usize];
+        for (i, e) in to_srgb.iter_mut().enumerate() {
+            let lin = i as f64 / f64::from(LINEAR_MAX);
+            let c = if lin <= 0.003_130_8 {
+                lin * 12.92
+            } else {
+                1.055 * lin.powf(1.0 / 2.4) - 0.055
+            };
+            *e = (c * 255.0).round() as u8;
+        }
+        Self { to_linear, to_srgb }
+    }
+
+    /// Shared instance (lazily built).
+    pub fn get() -> &'static Self {
+        use std::sync::OnceLock;
+        static LUTS: OnceLock<SrgbLuts> = OnceLock::new();
+        LUTS.get_or_init(Self::build)
+    }
+
+    #[inline]
+    fn lin(&self, srgb: u8) -> u32 {
+        u32::from(self.to_linear[srgb as usize])
+    }
+
+    #[inline]
+    fn srgb(&self, linear: u32) -> u8 {
+        self.to_srgb[linear.min(LINEAR_MAX) as usize]
+    }
+}
+
+/// Tuning parameters for [`PixfmtRgba32LcdLinear`].
+#[derive(Debug, Clone, Copy)]
+pub struct LcdBlendParams {
+    /// Skia-style contrast enhancement applied to per-stripe coverage
+    /// BEFORE compositing: `c' = c + contrast * c * (1 - c)`, with this
+    /// field as fixed-point 0..=255 over 1.0. Physically-linear blending
+    /// alone renders dark-on-light text slightly lighter than sRGB-space
+    /// blending did; a modest boost restores the expected stem weight
+    /// (ClearType hides the same issue inside its fixed gamma fudge).
+    pub contrast: u8,
+    /// 0 = full per-stripe freedom (physically correct for the panel).
+    /// 255 = stripes fully clamped to the pixel's luminance-correct
+    /// composite (grayscale-equivalent). Values between limit how far a
+    /// stripe may deviate from that composite: a CHROMA budget, not a
+    /// grayscale fade — stripe edge sharpness survives, the worst color
+    /// error does not. Applied per pixel against the actual background.
+    pub chroma_limit: u8,
+}
+
+impl Default for LcdBlendParams {
+    fn default() -> Self {
+        Self { contrast: 96, chroma_limit: 0 }
+    }
+}
+
+/// LCD subpixel pixel format with colorimetric (linear-light) blending.
+///
+/// Same 3x-resolution stripe model and 5-tap energy distribution as
+/// [`PixfmtRgba32Lcd`], but compositing happens in LINEAR light through
+/// [`SrgbLuts`], per stripe, against the ACTUAL destination pixel:
+///
+/// ```text
+/// out_ch = to_srgb( lin(fg_ch) * cover + lin(bg_ch) * (1 - cover) )
+/// ```
+///
+/// Blending sRGB code values directly (the classic ClearType-era model,
+/// and what [`PixfmtRgba32Lcd`] does) over- or under-weights partial
+/// coverage depending on where fg/bg sit on the transfer curve — on
+/// saturated backgrounds (white-on-green) the mid-coverage stripes land
+/// far off the perceptual line between the two colors, which reads as
+/// colored fringing and washed-out stems. In linear light the stripe
+/// value IS the physical mixture, which is what the eye integrates on a
+/// real RGB-stripe panel.
+pub struct PixfmtRgba32LcdLinear<'a> {
+    rbuf: &'a mut RowAccessor,
+    lut: &'a LcdDistributionLut,
+    params: LcdBlendParams,
+    luts: &'static SrgbLuts,
+}
+
+impl<'a> PixfmtRgba32LcdLinear<'a> {
+    pub fn new(
+        rbuf: &'a mut RowAccessor,
+        lut: &'a LcdDistributionLut,
+        params: LcdBlendParams,
+    ) -> Self {
+        Self { rbuf, lut, params, luts: SrgbLuts::get() }
+    }
+
+    #[inline]
+    fn actual_width(&self) -> u32 {
+        self.rbuf.width()
+    }
+
+    /// Contrast-enhance a coverage value (0..=255).
+    #[inline]
+    fn boost(&self, c: u32) -> u32 {
+        // c + contrast * c * (255 - c) / 255^2, staying in 0..=255
+        let k = u32::from(self.params.contrast);
+        (c + (k * c * (255 - c)) / (255 * 255)).min(255)
+    }
+
+    /// Composite one pixel: per-stripe linear blend of `fg` over the
+    /// destination using channel coverages `cov` (0..=255 each), with
+    /// the optional chroma budget. `a_fg` is the run's alpha (0..=255).
+    #[inline]
+    fn composite_pixel(&self, row: &mut [u8], pixel: usize, fg: &Rgba8, a_fg: u32, cov: [u32; 3]) {
+        let off = pixel * BPP;
+        let luts = self.luts;
+        let fg_lin = [
+            luts.lin(fg.r),
+            luts.lin(fg.g),
+            luts.lin(fg.b),
+        ];
+        let bg_lin = [
+            luts.lin(row[off]),
+            luts.lin(row[off + 1]),
+            luts.lin(row[off + 2]),
+        ];
+
+        // Per-stripe coverage with contrast, modulated by run alpha.
+        let mut c = [0u32; 3];
+        let mut any = false;
+        for i in 0..3 {
+            let boosted = self.boost(cov[i]);
+            c[i] = boosted * a_fg / 255;
+            any |= c[i] != 0;
+        }
+        if !any {
+            return;
+        }
+
+        // Linear src-over per stripe.
+        let mut out = [0u32; 3];
+        for i in 0..3 {
+            out[i] = (fg_lin[i] * c[i] + bg_lin[i] * (255 - c[i])) / 255;
+        }
+
+        // Chroma budget: limit stripe deviation from the luminance-correct
+        // composite (the same blend done with the MEAN coverage).
+        let clamp = u32::from(self.params.chroma_limit);
+        if clamp > 0 {
+            let c_mean = (c[0] + c[1] + c[2]) / 3;
+            for i in 0..3 {
+                let gray = (fg_lin[i] * c_mean + bg_lin[i] * (255 - c_mean)) / 255;
+                // out' = out + clamp/255 * (gray - out)
+                let o = i64::from(out[i]);
+                let g = i64::from(gray);
+                out[i] = (o + (i64::from(clamp) * (g - o)) / 255) as u32;
+            }
+        }
+
+        row[off] = luts.srgb(out[0]);
+        row[off + 1] = luts.srgb(out[1]);
+        row[off + 2] = luts.srgb(out[2]);
+        row[off + 3] = 255;
+    }
+}
+
+impl<'a> PixelFormat for PixfmtRgba32LcdLinear<'a> {
+    type ColorType = Rgba8;
+
+    fn width(&self) -> u32 {
+        self.rbuf.width() * 3
+    }
+
+    fn height(&self) -> u32 {
+        self.rbuf.height()
+    }
+
+    fn pixel(&self, x: i32, y: i32) -> Rgba8 {
+        let pixel = x as usize / 3;
+        let actual_w = self.actual_width() as usize;
+        if pixel >= actual_w {
+            return Rgba8::new(0, 0, 0, 0);
+        }
+        let row = unsafe {
+            let ptr = self.rbuf.row_ptr(y);
+            std::slice::from_raw_parts(ptr, actual_w * BPP)
+        };
+        let off = pixel * BPP;
+        Rgba8::new(
+            row[off] as u32,
+            row[off + 1] as u32,
+            row[off + 2] as u32,
+            row[off + 3] as u32,
+        )
+    }
+
+    fn copy_pixel(&mut self, x: i32, y: i32, c: &Rgba8) {
+        let pixel = x as usize / 3;
+        let actual_w = self.actual_width() as usize;
+        if pixel >= actual_w {
+            return;
+        }
+        let row = unsafe {
+            let ptr = self.rbuf.row_ptr(y);
+            std::slice::from_raw_parts_mut(ptr, actual_w * BPP)
+        };
+        let off = pixel * BPP;
+        row[off] = c.r;
+        row[off + 1] = c.g;
+        row[off + 2] = c.b;
+        row[off + 3] = c.a;
+    }
+
+    fn copy_hline(&mut self, x: i32, y: i32, len: u32, c: &Rgba8) {
+        let actual_w = self.actual_width() as usize;
+        let row = unsafe {
+            let ptr = self.rbuf.row_ptr(y);
+            std::slice::from_raw_parts_mut(ptr, actual_w * BPP)
+        };
+        for k in 0..len as usize {
+            let sp = x as usize + k;
+            let pixel = sp / 3;
+            let channel = sp % 3;
+            if pixel >= actual_w {
+                break;
+            }
+            let byte_off = pixel * BPP + channel;
+            row[byte_off] = [c.r, c.g, c.b][channel];
+            row[pixel * BPP + 3] = 255;
+        }
+    }
+
+    fn blend_pixel(&mut self, x: i32, y: i32, c: &Rgba8, cover: CoverType) {
+        // Single-stripe blend: gather into a one-pixel composite.
+        let sp = x as usize;
+        let pixel = sp / 3;
+        let channel = sp % 3;
+        let actual_w = self.actual_width() as usize;
+        if pixel >= actual_w {
+            return;
+        }
+        let row = unsafe {
+            let ptr = self.rbuf.row_ptr(y);
+            std::slice::from_raw_parts_mut(ptr, actual_w * BPP)
+        };
+        let mut cov = [0u32; 3];
+        cov[channel] = u32::from(cover);
+        self.composite_pixel(row, pixel, c, u32::from(c.a), cov);
+    }
+
+    fn blend_hline(&mut self, x: i32, y: i32, len: u32, c: &Rgba8, cover: CoverType) {
+        let actual_w = self.actual_width() as usize;
+        let row = unsafe {
+            let ptr = self.rbuf.row_ptr(y);
+            std::slice::from_raw_parts_mut(ptr, actual_w * BPP)
+        };
+        // Group the affected stripe range into whole pixels.
+        let sp_end = x as usize + len as usize;
+        let mut sp = x as usize;
+        while sp < sp_end {
+            let pixel = sp / 3;
+            if pixel >= actual_w {
+                break;
+            }
+            let mut cov = [0u32; 3];
+            for ch in 0..3 {
+                let s = pixel * 3 + ch;
+                if s >= x as usize && s < sp_end {
+                    cov[ch] = u32::from(cover);
+                }
+            }
+            self.composite_pixel(row, pixel, c, u32::from(c.a), cov);
+            sp = (pixel + 1) * 3;
+        }
+    }
+
+    /// 5-tap distribution identical to [`PixfmtRgba32Lcd`], then one
+    /// linear-light composite PER PIXEL with the gathered stripe triple.
+    fn blend_solid_hspan(
+        &mut self,
+        x: i32,
+        y: i32,
+        len: u32,
+        c: &Rgba8,
+        covers: &[CoverType],
+    ) {
+        let len = len as usize;
+
+        let dist_len = len + 4;
+        let mut c3 = vec![0u8; dist_len];
+        for i in 0..len {
+            let cv = covers[i];
+            c3[i] = c3[i].wrapping_add(self.lut.tertiary(cv));
+            c3[i + 1] = c3[i + 1].wrapping_add(self.lut.secondary(cv));
+            c3[i + 2] = c3[i + 2].wrapping_add(self.lut.primary(cv));
+            c3[i + 3] = c3[i + 3].wrapping_add(self.lut.secondary(cv));
+            c3[i + 4] = c3[i + 4].wrapping_add(self.lut.tertiary(cv));
+        }
+
+        let sp_first = x as i64 - 2;
+        let sp_last = sp_first + dist_len as i64; // exclusive
+        let actual_w = self.actual_width() as usize;
+        let row = unsafe {
+            let ptr = self.rbuf.row_ptr(y);
+            std::slice::from_raw_parts_mut(ptr, actual_w * BPP)
+        };
+
+        let first_pixel = (sp_first.max(0) / 3) as usize;
+        let last_pixel = (((sp_last - 1).max(0)) / 3) as usize;
+        let a_fg = u32::from(c.a);
+
+        for pixel in first_pixel..=last_pixel {
+            if pixel >= actual_w {
+                break;
+            }
+            let mut cov = [0u32; 3];
+            let mut any = false;
+            for ch in 0..3 {
+                let sp = (pixel * 3 + ch) as i64;
+                if sp >= sp_first && sp < sp_last {
+                    let v = c3[(sp - sp_first) as usize];
+                    cov[ch] = u32::from(v);
+                    any |= v != 0;
+                }
+            }
+            if any {
+                self.composite_pixel(row, pixel, c, a_fg, cov);
+            }
+        }
+    }
+
+    fn blend_color_hspan(
+        &mut self,
+        x: i32,
+        y: i32,
+        len: u32,
+        colors: &[Rgba8],
+        covers: &[CoverType],
+        cover: CoverType,
+    ) {
+        // Per-stripe colors cannot be gathered into one composite; blend
+        // stripe-by-stripe (rarely used for text).
+        let actual_w = self.actual_width() as usize;
+        let row = unsafe {
+            let ptr = self.rbuf.row_ptr(y);
+            std::slice::from_raw_parts_mut(ptr, actual_w * BPP)
+        };
+        for k in 0..len as usize {
+            let sp = x as usize + k;
+            let pixel = sp / 3;
+            let channel = sp % 3;
+            if pixel >= actual_w {
+                break;
+            }
+            let col = &colors[k];
+            let cov = if covers.is_empty() { cover } else { covers[k] };
+            let mut c3 = [0u32; 3];
+            c3[channel] = u32::from(cov);
+            self.composite_pixel(row, pixel, col, u32::from(col.a), c3);
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -457,5 +844,82 @@ mod tests {
             "Expected darkened pixel, got {:?}",
             (p.r, p.g, p.b)
         );
+    }
+}
+
+#[cfg(test)]
+mod linear_tests {
+    use super::*;
+
+    fn make_buffer_colored(w: u32, h: u32, rgba: [u8; 4]) -> (Vec<u8>, RowAccessor) {
+        let stride = (w * BPP as u32) as i32;
+        let mut buf = Vec::with_capacity((h * w * BPP as u32) as usize);
+        for _ in 0..(h * w) {
+            buf.extend_from_slice(&rgba);
+        }
+        let mut ra = RowAccessor::new();
+        unsafe {
+            ra.attach(buf.as_ptr() as *mut u8, w, h, stride);
+        }
+        (buf, ra)
+    }
+
+    #[test]
+    fn srgb_luts_round_trip_exactly() {
+        let luts = SrgbLuts::get();
+        for v in 0..=255u8 {
+            assert_eq!(luts.srgb(luts.lin(v)), v, "sRGB LUT round trip failed at {v}");
+        }
+    }
+
+    /// The core gamma assertion: 50% coverage of white over black must land
+    /// at the LINEAR midpoint (sRGB ~188), not the sRGB code midpoint (128).
+    /// Legacy sRGB-space blending yields ~127 — visibly too dark, which is
+    /// exactly why thin light-on-dark text used to disappear.
+    #[test]
+    fn half_coverage_white_on_black_is_the_linear_midpoint() {
+        let (_buf, mut ra) = make_buffer_colored(4, 1, [0, 0, 0, 255]);
+        let lut = LcdDistributionLut::new(1.0, 0.0, 0.0); // identity distribution
+        let params = LcdBlendParams { contrast: 0, chroma_limit: 0 };
+        let mut pf = PixfmtRgba32LcdLinear::new(&mut ra, &lut, params);
+        let covers = [128u8; 3]; // one full pixel, all three stripes at ~50%
+        let white = Rgba8::new(255, 255, 255, 255);
+        pf.blend_solid_hspan(3, 0, 3, &white, &covers);
+        let p = pf.pixel(3, 0); // pixel 1
+        assert!(
+            (183..=193).contains(&(p.g as i32)),
+            "50% white over black must encode ~188 (linear midpoint), got {}",
+            p.g
+        );
+    }
+
+    #[test]
+    fn full_coverage_reaches_exact_fg_color() {
+        let (_buf, mut ra) = make_buffer_colored(4, 1, [0, 128, 0, 255]);
+        let lut = LcdDistributionLut::new(1.0, 0.0, 0.0);
+        let params = LcdBlendParams { contrast: 96, chroma_limit: 0 };
+        let mut pf = PixfmtRgba32LcdLinear::new(&mut ra, &lut, params);
+        let covers = [255u8; 3];
+        let white = Rgba8::new(255, 255, 255, 255);
+        pf.blend_solid_hspan(3, 0, 3, &white, &covers);
+        let p = pf.pixel(3, 0);
+        assert_eq!((p.r, p.g, p.b), (255, 255, 255), "full coverage must hit fg exactly");
+    }
+
+    /// chroma_limit=255 must make all three stripes equal the mean-coverage
+    /// composite (grayscale-equivalent), regardless of per-stripe covers.
+    #[test]
+    fn chroma_limit_full_equalizes_stripes() {
+        let (_buf, mut ra) = make_buffer_colored(4, 1, [0, 128, 0, 255]);
+        let lut = LcdDistributionLut::new(1.0, 0.0, 0.0);
+        let params = LcdBlendParams { contrast: 0, chroma_limit: 255 };
+        let mut pf = PixfmtRgba32LcdLinear::new(&mut ra, &lut, params);
+        let covers = [255u8, 128, 0]; // wildly unequal stripes
+        let white = Rgba8::new(255, 255, 255, 255);
+        pf.blend_solid_hspan(3, 0, 3, &white, &covers);
+        let p = pf.pixel(3, 0);
+        // R stripe composite with mean coverage vs B stripe: both driven to
+        // the same mean, so R and B (equal bg, equal fg) must match.
+        assert_eq!(p.r, p.b, "full chroma clamp must equalize stripes over equal fg/bg channels");
     }
 }
