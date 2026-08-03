@@ -460,11 +460,20 @@ pub struct LcdBlendParams {
     /// grayscale fade — stripe edge sharpness survives, the worst color
     /// error does not. Applied per pixel against the actual background.
     pub chroma_limit: u8,
+    /// Coverage tone curve, fixed-point x100 (100 = linear coverage,
+    /// 220 = c^(1/2.2)). Pure linear-light compositing renders
+    /// dark-on-light text noticeably lighter than every shipping
+    /// rasterizer (Skia/ClearType blend in an intermediate gamma space
+    /// precisely for this); raising coverage through a power curve
+    /// restores conventional stem weight while KEEPING the per-stripe
+    /// linear mixing that fixes saturated-background fringing. Applied
+    /// before `contrast`.
+    pub coverage_gamma: u8,
 }
 
 impl Default for LcdBlendParams {
     fn default() -> Self {
-        Self { contrast: 96, chroma_limit: 0 }
+        Self { contrast: 0, chroma_limit: 0, coverage_gamma: 220 }
     }
 }
 
@@ -491,6 +500,8 @@ pub struct PixfmtRgba32LcdLinear<'a> {
     lut: &'a LcdDistributionLut,
     params: LcdBlendParams,
     luts: &'static SrgbLuts,
+    /// Coverage tone LUT for `params.coverage_gamma` (identity at 100).
+    cover_lut: [u8; 256],
 }
 
 impl<'a> PixfmtRgba32LcdLinear<'a> {
@@ -499,7 +510,14 @@ impl<'a> PixfmtRgba32LcdLinear<'a> {
         lut: &'a LcdDistributionLut,
         params: LcdBlendParams,
     ) -> Self {
-        Self { rbuf, lut, params, luts: SrgbLuts::get() }
+        let g = f64::from(params.coverage_gamma.max(1)) / 100.0;
+        let inv = 1.0 / g;
+        let mut cover_lut = [0u8; 256];
+        for (i, e) in cover_lut.iter_mut().enumerate() {
+            let c = (i as f64 / 255.0).powf(inv);
+            *e = (c * 255.0).round() as u8;
+        }
+        Self { rbuf, lut, params, luts: SrgbLuts::get(), cover_lut }
     }
 
     #[inline]
@@ -507,9 +525,10 @@ impl<'a> PixfmtRgba32LcdLinear<'a> {
         self.rbuf.width()
     }
 
-    /// Contrast-enhance a coverage value (0..=255).
+    /// Coverage tone curve + contrast enhancement (0..=255).
     #[inline]
     fn boost(&self, c: u32) -> u32 {
+        let c = u32::from(self.cover_lut[c as usize]);
         // c + contrast * c * (255 - c) / 255^2, staying in 0..=255
         let k = u32::from(self.params.contrast);
         (c + (k * c * (255 - c)) / (255 * 255)).min(255)
@@ -880,7 +899,7 @@ mod linear_tests {
     fn half_coverage_white_on_black_is_the_linear_midpoint() {
         let (_buf, mut ra) = make_buffer_colored(4, 1, [0, 0, 0, 255]);
         let lut = LcdDistributionLut::new(1.0, 0.0, 0.0); // identity distribution
-        let params = LcdBlendParams { contrast: 0, chroma_limit: 0 };
+        let params = LcdBlendParams { contrast: 0, chroma_limit: 0, coverage_gamma: 100 };
         let mut pf = PixfmtRgba32LcdLinear::new(&mut ra, &lut, params);
         let covers = [128u8; 3]; // one full pixel, all three stripes at ~50%
         let white = Rgba8::new(255, 255, 255, 255);
@@ -897,7 +916,7 @@ mod linear_tests {
     fn full_coverage_reaches_exact_fg_color() {
         let (_buf, mut ra) = make_buffer_colored(4, 1, [0, 128, 0, 255]);
         let lut = LcdDistributionLut::new(1.0, 0.0, 0.0);
-        let params = LcdBlendParams { contrast: 96, chroma_limit: 0 };
+        let params = LcdBlendParams { contrast: 0, chroma_limit: 0, coverage_gamma: 220 };
         let mut pf = PixfmtRgba32LcdLinear::new(&mut ra, &lut, params);
         let covers = [255u8; 3];
         let white = Rgba8::new(255, 255, 255, 255);
@@ -912,7 +931,7 @@ mod linear_tests {
     fn chroma_limit_full_equalizes_stripes() {
         let (_buf, mut ra) = make_buffer_colored(4, 1, [0, 128, 0, 255]);
         let lut = LcdDistributionLut::new(1.0, 0.0, 0.0);
-        let params = LcdBlendParams { contrast: 0, chroma_limit: 255 };
+        let params = LcdBlendParams { contrast: 0, chroma_limit: 255, coverage_gamma: 100 };
         let mut pf = PixfmtRgba32LcdLinear::new(&mut ra, &lut, params);
         let covers = [255u8, 128, 0]; // wildly unequal stripes
         let white = Rgba8::new(255, 255, 255, 255);
