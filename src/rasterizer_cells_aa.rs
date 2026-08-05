@@ -84,6 +84,10 @@ struct SortedY {
 pub struct RasterizerCellsAa {
     cells: Vec<CellAa>,
     sorted_cells: Vec<u32>,
+    /// Scratch for the per-scanline X sort, see `sort_cells` pass 3.
+    /// Kept on the struct so a frame's worth of scanlines reuses one
+    /// allocation instead of one per scanline.
+    sort_scratch: Vec<u64>,
     sorted_y: Vec<SortedY>,
     curr_cell: CellAa,
     style_cell: CellAa,
@@ -103,6 +107,7 @@ impl RasterizerCellsAa {
         Self {
             cells: Vec::new(),
             sorted_cells: Vec::new(),
+            sort_scratch: Vec::new(),
             sorted_y: Vec::new(),
             curr_cell: CellAa::default(),
             style_cell: CellAa::default(),
@@ -542,16 +547,54 @@ impl RasterizerCellsAa {
             sy.num += 1;
         }
 
-        // Pass 3: Sort each scanline's cells by X
-        for sy in &self.sorted_y {
-            if sy.num > 0 {
+        // Pass 3: Sort each scanline's cells by X.
+        //
+        // The key is PACKED INTO the sorted element rather than fetched
+        // through the index. Sorting bare indices with
+        // `sort_unstable_by_key(|&i| cells[i].x)` makes every single
+        // comparison a random read into the cell array, which for text —
+        // tens of thousands of cells per run, scattered across glyphs — is
+        // dominated by cache misses rather than by the comparisons
+        // themselves. Profiling a page of LCD text put quicksort +
+        // small-sort + this function at ~18% of the whole frame, ahead of
+        // both the scanline sweep and the pixel blending.
+        //
+        // Packing `(biased_x << 32) | index` into a u64 turns it into a
+        // plain sort over a contiguous integer array: the key travels with
+        // the element, so no indirection, and `sort_unstable` on u64 uses
+        // its specialised path. Ties on x now break by index, which is
+        // MORE deterministic than before; cells sharing an (x, y) are
+        // summed by the sweep, and integer addition is commutative, so the
+        // rendered result is unchanged.
+        //
+        // `mem::take` moves the two Vecs out for the duration so the loop
+        // can borrow `sorted_y`, `cells` and `sorted_cells` at once; both
+        // are handed straight back.
+        let sorted_y = core::mem::take(&mut self.sorted_y);
+        let mut scratch = core::mem::take(&mut self.sort_scratch);
+        for sy in &sorted_y {
+            if sy.num > 1 {
                 let start = sy.start as usize;
                 let end = (sy.start + sy.num) as usize;
-                let slice = &mut self.sorted_cells[start..end];
-                let cells = &self.cells;
-                slice.sort_unstable_by_key(|&idx| cells[idx as usize].x);
+                scratch.clear();
+                scratch.extend(self.sorted_cells[start..end].iter().map(|&idx| {
+                    let x = self.cells[idx as usize].x;
+                    // Bias i32 -> u32 so the unsigned sort orders negative
+                    // x correctly.
+                    let bias = (i64::from(x) - i64::from(i32::MIN)) as u64;
+                    (bias << 32) | u64::from(idx)
+                }));
+                scratch.sort_unstable();
+                for (dst, &v) in self.sorted_cells[start..end]
+                    .iter_mut()
+                    .zip(scratch.iter())
+                {
+                    *dst = v as u32;
+                }
             }
         }
+        self.sorted_y = sorted_y;
+        self.sort_scratch = scratch;
 
         self.sorted = true;
     }
