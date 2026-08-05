@@ -648,18 +648,15 @@ impl<'a> PixfmtRgba32LcdLinear<'a> {
     fn composite_pixel(&self, row: &mut [u8], pixel: usize, fg: &Rgba8, a_fg: u32, cov: [u32; 3]) {
         let off = pixel * BPP;
         let luts = self.luts;
-        let fg_lin = [
-            luts.lin(fg.r),
-            luts.lin(fg.g),
-            luts.lin(fg.b),
-        ];
-        let bg_lin = [
-            luts.lin(row[off]),
-            luts.lin(row[off + 1]),
-            luts.lin(row[off + 2]),
-        ];
 
         // Per-stripe coverage with contrast, modulated by run alpha.
+        //
+        // Computed BEFORE the sRGB->linear lookups, not after. The early-out
+        // below fires for any pixel whose three stripes are all uncovered,
+        // and the 5-tap FIR spreads a span two sub-pixels past each end, so
+        // those pixels are ordinary at every span edge. Doing the lookups
+        // first meant six table reads per pixel thrown away — a dependent
+        // load each, on the hottest loop in LCD text.
         let mut c = [0u32; 3];
         let mut any = false;
         for i in 0..3 {
@@ -670,6 +667,17 @@ impl<'a> PixfmtRgba32LcdLinear<'a> {
         if !any {
             return;
         }
+
+        let fg_lin = [
+            luts.lin(fg.r),
+            luts.lin(fg.g),
+            luts.lin(fg.b),
+        ];
+        let bg_lin = [
+            luts.lin(row[off]),
+            luts.lin(row[off + 1]),
+            luts.lin(row[off + 2]),
+        ];
 
         // Linear src-over per stripe.
         let mut out = [0u32; 3];
