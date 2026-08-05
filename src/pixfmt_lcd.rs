@@ -101,15 +101,25 @@ const BPP: usize = 4; // bytes per pixel in RGBA32
 /// The `blend_solid_hspan` method distributes each coverage value across
 /// 5 neighboring subpixels (tertiary, secondary, primary, secondary, tertiary)
 /// using the `LcdDistributionLut`, matching the C++ implementation exactly.
+/// Capacity the per-span 5-tap distribution scratch buffer starts at.
+///
+/// A span is a horizontal run of covered sub-pixels; for text these are
+/// short (a glyph stem is a handful of stripes) and there are very many of
+/// them. Pre-sizing to a comfortable span length means the buffer is
+/// allocated once per pixfmt rather than once per span.
+const SPAN_SCRATCH: usize = 256;
+
 pub struct PixfmtRgba32Lcd<'a> {
     rbuf: &'a mut RowAccessor,
     lut: &'a LcdDistributionLut,
+    /// Reusable 5-tap distribution buffer, see [`SPAN_SCRATCH`].
+    c3: Vec<u8>,
 }
 
 impl<'a> PixfmtRgba32Lcd<'a> {
     /// Create a new LCD pixel format wrapping an RGBA32 rendering buffer.
     pub fn new(rbuf: &'a mut RowAccessor, lut: &'a LcdDistributionLut) -> Self {
-        Self { rbuf, lut }
+        Self { rbuf, lut, c3: Vec::with_capacity(SPAN_SCRATCH) }
     }
 
     /// Get the actual (non-subpixel) width.
@@ -273,7 +283,15 @@ impl<'a> PixelFormat for PixfmtRgba32Lcd<'a> {
         //               c3[i+2] += primary,  c3[i+3] += secondary,
         //               c3[i+4] += tertiary
         let dist_len = len + 4;
-        let mut c3 = vec![0u8; dist_len];
+        // Reuse the scratch buffer. This used to be `vec![0u8; dist_len]`,
+        // i.e. a heap allocation and free for EVERY span. Text rasterizes
+        // into hundreds of thousands of short spans per frame, so the
+        // malloc/free pair — not the blending arithmetic — dominated.
+        // Moved out of `self` (a move, not a copy) so the body can still
+        // borrow `self.rbuf`/`self.lut`; handed back before returning.
+        let mut c3 = core::mem::take(&mut self.c3);
+        c3.clear();
+        c3.resize(dist_len, 0);
 
         for i in 0..len {
             let cv = covers[i];
@@ -293,6 +311,7 @@ impl<'a> PixelFormat for PixfmtRgba32Lcd<'a> {
             let skip = (-sp_start) as usize;
             c3_offset = skip;
             if skip >= remaining {
+                self.c3 = c3;
                 return;
             }
             remaining -= skip;
@@ -335,6 +354,7 @@ impl<'a> PixelFormat for PixfmtRgba32Lcd<'a> {
                 row[pixel * BPP + 3] = 255;
             }
         }
+        self.c3 = c3;
     }
 
     fn blend_color_hspan(
@@ -502,6 +522,8 @@ pub struct PixfmtRgba32LcdLinear<'a> {
     luts: &'static SrgbLuts,
     /// Coverage tone LUT for `params.coverage_gamma` (identity at 100).
     cover_lut: [u8; 256],
+    /// Reusable 5-tap distribution buffer, see [`SPAN_SCRATCH`].
+    c3: Vec<u8>,
 }
 
 impl<'a> PixfmtRgba32LcdLinear<'a> {
@@ -517,7 +539,14 @@ impl<'a> PixfmtRgba32LcdLinear<'a> {
             let c = (i as f64 / 255.0).powf(inv);
             *e = (c * 255.0).round() as u8;
         }
-        Self { rbuf, lut, params, luts: SrgbLuts::get(), cover_lut }
+        Self {
+            rbuf,
+            lut,
+            params,
+            luts: SrgbLuts::get(),
+            cover_lut,
+            c3: Vec::with_capacity(SPAN_SCRATCH),
+        }
     }
 
     #[inline]
@@ -714,7 +743,13 @@ impl<'a> PixelFormat for PixfmtRgba32LcdLinear<'a> {
         let len = len as usize;
 
         let dist_len = len + 4;
-        let mut c3 = vec![0u8; dist_len];
+        // See the note in `PixfmtRgba32Lcd::blend_solid_hspan`: one heap
+        // allocation per span was the dominant cost of LCD text.
+        // Moved out of `self` (a move, not a copy) so the body can still
+        // borrow `self.rbuf`/`self.lut`; handed back before returning.
+        let mut c3 = core::mem::take(&mut self.c3);
+        c3.clear();
+        c3.resize(dist_len, 0);
         for i in 0..len {
             let cv = covers[i];
             c3[i] = c3[i].wrapping_add(self.lut.tertiary(cv));
@@ -754,6 +789,7 @@ impl<'a> PixelFormat for PixfmtRgba32LcdLinear<'a> {
                 self.composite_pixel(row, pixel, c, a_fg, cov);
             }
         }
+        self.c3 = c3;
     }
 
     fn blend_color_hspan(
