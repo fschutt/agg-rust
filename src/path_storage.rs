@@ -35,6 +35,21 @@ impl PathStorage {
         }
     }
 
+    /// Create an empty path storage with room for `vertices` vertices.
+    ///
+    /// Callers that know the vertex count up front — a glyph outline knows
+    /// it from the font's point and contour counts — otherwise grow the
+    /// `Vec` from empty. A downstream glyph cache measured 45969
+    /// `RawVec::finish_grow` calls holding 8.32 MB, and because those paths
+    /// are CACHED for the process lifetime the growth slack is retained
+    /// with them.
+    pub fn with_capacity(vertices: usize) -> Self {
+        Self {
+            vertices: Vec::with_capacity(vertices),
+            iterator: 0,
+        }
+    }
+
     /// Remove all vertices (keeps allocated memory).
     pub fn remove_all(&mut self) {
         self.vertices.clear();
