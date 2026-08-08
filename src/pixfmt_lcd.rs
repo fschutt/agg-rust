@@ -114,12 +114,29 @@ pub struct PixfmtRgba32Lcd<'a> {
     lut: &'a LcdDistributionLut,
     /// Reusable 5-tap distribution buffer, see [`SPAN_SCRATCH`].
     c3: Vec<u8>,
+    /// Stripe-space horizontal write window `[x0, x1)`, see
+    /// [`Self::set_stripe_clip`].
+    stripe_clip: Option<(i32, i32)>,
 }
 
 impl<'a> PixfmtRgba32Lcd<'a> {
     /// Create a new LCD pixel format wrapping an RGBA32 rendering buffer.
     pub fn new(rbuf: &'a mut RowAccessor, lut: &'a LcdDistributionLut) -> Self {
-        Self { rbuf, lut, c3: Vec::with_capacity(SPAN_SCRATCH) }
+        Self { rbuf, lut, c3: Vec::with_capacity(SPAN_SCRATCH), stripe_clip: None }
+    }
+
+    /// Restrict all writes to the stripe-space window `[x0, x1)`.
+    ///
+    /// The 5-tap FIR distribution in `blend_solid_hspan` writes up to 2
+    /// stripes BEFORE and AFTER the span it is handed, so a renderer-base
+    /// clip box alone cannot bound the writes: a span starting exactly at
+    /// the clip's left edge still fringes 2 stripes (one device pixel)
+    /// past it, and a damage-rect repaint then double-blends that fringe
+    /// over retained pixels. Callers repainting a sub-rectangle must set
+    /// this to the SAME window as the renderer-base clip box
+    /// (`x0_px * 3`, `x1_px * 3`).
+    pub fn set_stripe_clip(&mut self, x0: i32, x1: i32) {
+        self.stripe_clip = Some((x0, x1));
     }
 
     /// Get the actual (non-subpixel) width.
@@ -307,15 +324,31 @@ impl<'a> PixelFormat for PixfmtRgba32Lcd<'a> {
         let mut c3_offset = 0usize;
         let mut remaining = dist_len;
 
-        if sp_start < 0 {
-            let skip = (-sp_start) as usize;
+        // The buffer edge and the optional stripe clip bound the window
+        // identically: skip distributed stripes on the left, cut on the
+        // right. Hoisted out of the pixel loop — zero per-stripe cost.
+        let (clip_lo, clip_hi) = self.stripe_clip.unwrap_or((0, i32::MAX));
+        let lo = clip_lo.max(0);
+        if sp_start < lo {
+            let skip = (lo - sp_start) as usize;
             c3_offset = skip;
             if skip >= remaining {
                 self.c3 = c3;
                 return;
             }
             remaining -= skip;
-            sp_start = 0;
+            sp_start = lo;
+        }
+        if clip_hi != i32::MAX {
+            let end = sp_start + remaining as i32;
+            if end > clip_hi {
+                let cut = (end - clip_hi) as usize;
+                if cut >= remaining {
+                    self.c3 = c3;
+                    return;
+                }
+                remaining -= cut;
+            }
         }
 
         // Step 3: Apply distributed covers to RGBA buffer
@@ -608,6 +641,9 @@ pub struct PixfmtRgba32LcdLinear<'a> {
     cover_lut: [u8; 256],
     /// Reusable 5-tap distribution buffer, see [`SPAN_SCRATCH`].
     c3: Vec<u8>,
+    /// Stripe-space horizontal write window `[x0, x1)`, see
+    /// [`PixfmtRgba32Lcd::set_stripe_clip`].
+    stripe_clip: Option<(i32, i32)>,
 }
 
 impl<'a> PixfmtRgba32LcdLinear<'a> {
@@ -624,7 +660,15 @@ impl<'a> PixfmtRgba32LcdLinear<'a> {
             luts: SrgbLuts::get(),
             cover_lut,
             c3: Vec::with_capacity(SPAN_SCRATCH),
+            stripe_clip: None,
         }
+    }
+
+    /// Restrict all writes to the stripe-space window `[x0, x1)` — the FIR
+    /// spread escapes the renderer-base clip otherwise; see
+    /// [`PixfmtRgba32Lcd::set_stripe_clip`].
+    pub fn set_stripe_clip(&mut self, x0: i32, x1: i32) {
+        self.stripe_clip = Some((x0, x1));
     }
 
     #[inline]
@@ -853,8 +897,22 @@ impl<'a> PixelFormat for PixfmtRgba32LcdLinear<'a> {
             std::slice::from_raw_parts_mut(ptr, actual_w * BPP)
         };
 
-        let first_pixel = (sp_first.max(0) / 3) as usize;
-        let last_pixel = (((sp_last - 1).max(0)) / 3) as usize;
+        // Visible window: the distributed range ∩ the optional stripe clip.
+        // The FIR spread writes 2 stripes past the span on each side, which
+        // the renderer-base clip cannot see; see `set_stripe_clip`.
+        let (clip_lo, clip_hi) = self.stripe_clip.unwrap_or((0, i32::MAX));
+        let sp_vis_first = sp_first.max(i64::from(clip_lo)).max(0);
+        let sp_vis_last = if clip_hi == i32::MAX {
+            sp_last
+        } else {
+            sp_last.min(i64::from(clip_hi))
+        };
+        if sp_vis_last <= sp_vis_first {
+            self.c3 = c3;
+            return;
+        }
+        let first_pixel = (sp_vis_first / 3) as usize;
+        let last_pixel = ((sp_vis_last - 1) / 3) as usize;
         let a_fg = u32::from(c.a);
 
         for pixel in first_pixel..=last_pixel {
@@ -865,7 +923,7 @@ impl<'a> PixelFormat for PixfmtRgba32LcdLinear<'a> {
             let mut any = false;
             for ch in 0..3 {
                 let sp = (pixel * 3 + ch) as i64;
-                if sp >= sp_first && sp < sp_last {
+                if sp >= sp_vis_first && sp < sp_vis_last {
                     let v = c3[(sp - sp_first) as usize];
                     cov[ch] = u32::from(v);
                     any |= v != 0;
@@ -955,6 +1013,60 @@ mod tests {
             ra.attach(buf.as_ptr() as *mut u8, w, h, stride);
         }
         (buf, ra)
+    }
+
+    /// A span starting exactly at a clip edge fringes 2 stripes past it via
+    /// the 5-tap FIR — `set_stripe_clip` must bound those writes, in both
+    /// pixfmt variants. Damage-rect repaints double-blend retained fringe
+    /// without this (azul task #17). The unclipped arm is this test's own
+    /// negative control: it proves the spill exists to be clamped.
+    #[test]
+    fn test_stripe_clip_bounds_the_fir_spread() {
+        let lut = LcdDistributionLut::new(1.0 / 3.0, 2.0 / 9.0, 1.0 / 9.0);
+        let black = Rgba8::new(0, 0, 0, 255);
+        let covers = [255u8; 30];
+        // Span covers pixels 8.. (stripes 24..54); clip window = the same.
+        // Pixel 7 = bytes 28..32; its stripes 21..24 sit LEFT of the span.
+        let run = |clip: bool, linear: bool| -> Vec<u8> {
+            let (buf, mut ra) = make_buffer(40, 4);
+            if linear {
+                let params = LcdBlendParams::default();
+                let mut pf = PixfmtRgba32LcdLinear::new(&mut ra, &lut, params);
+                if clip {
+                    pf.set_stripe_clip(24, 54);
+                }
+                pf.blend_solid_hspan(24, 1, 30, &black, &covers);
+            } else {
+                let mut pf = PixfmtRgba32Lcd::new(&mut ra, &lut);
+                if clip {
+                    pf.set_stripe_clip(24, 54);
+                }
+                pf.blend_solid_hspan(24, 1, 30, &black, &covers);
+            }
+            buf
+        };
+        for linear in [false, true] {
+            let unclipped = run(false, linear);
+            let clipped = run(true, linear);
+            let px = |b: &Vec<u8>, x: usize| -> [u8; 4] {
+                let o = (40 * BPP) + x * BPP; // row y=1
+                [b[o], b[o + 1], b[o + 2], b[o + 3]]
+            };
+            // Negative control: without the clip the FIR spills into px 7
+            // and past the right edge (px 18, stripes 54..56).
+            assert_ne!(
+                px(&unclipped, 7),
+                [255, 255, 255, 255],
+                "linear={linear}: expected the unclipped FIR to spill into pixel 7 — \
+                 if it no longer does, the clamp may be dead code"
+            );
+            assert_ne!(px(&unclipped, 18), [255, 255, 255, 255], "linear={linear} right spill");
+            // The clamp: everything left of stripe 24 and right of 54 untouched.
+            assert_eq!(px(&clipped, 7), [255, 255, 255, 255], "linear={linear} left clamp");
+            assert_eq!(px(&clipped, 18), [255, 255, 255, 255], "linear={linear} right clamp");
+            // And the interior still painted (the clamp must not eat the span).
+            assert_ne!(px(&clipped, 10), [255, 255, 255, 255], "linear={linear} interior");
+        }
     }
 
     #[test]
