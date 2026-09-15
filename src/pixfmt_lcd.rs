@@ -95,12 +95,46 @@ const BPP: usize = 4; // bytes per pixel in RGBA32
 /// horizontal resolution. Each "subpixel" maps to one R, G, or B channel
 /// of an actual RGBA pixel:
 ///
-/// - Subpixel `sp` → pixel `sp / 3`, channel `sp % 3` (0=R, 1=G, 2=B)
-/// - Byte offset: `(sp / 3) * 4 + (sp % 3)`
+/// - Subpixel `sp` → pixel `sp / 3`, stripe `sp % 3`, channel `order.channel(sp % 3)`
+///   (0=R, 1=G, 2=B; [`LcdSubpixelOrder::Rgb`] maps stripe N to channel N)
+/// - Byte offset: `(sp / 3) * 4 + order.channel(sp % 3)`
 ///
 /// The `blend_solid_hspan` method distributes each coverage value across
 /// 5 neighboring subpixels (tertiary, secondary, primary, secondary, tertiary)
 /// using the `LcdDistributionLut`, matching the C++ implementation exactly.
+/// Physical order of the colour stripes inside one LCD pixel, left to right.
+///
+/// Subpixel text addresses each stripe separately, so a glyph rendered for
+/// one order on a panel with the other gets its colour fringes mirrored: the
+/// orange and blue edges trade sides and stems look smeared instead of
+/// sharpened. Most panels are [`Rgb`](Self::Rgb); some laptops and rotated
+/// monitors are [`Bgr`](Self::Bgr). The platform reports which one a display
+/// has (ClearType's per-monitor `PixelStructure` on Windows, `FC_RGBA` from
+/// fontconfig), so the caller picks, per window, per monitor.
+///
+/// Horizontal orders only: a vertical panel needs the sub-samples taken on the
+/// y axis, which these pixel formats do not do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LcdSubpixelOrder {
+    /// Red, green, blue from left to right.
+    #[default]
+    Rgb,
+    /// Blue, green, red from left to right.
+    Bgr,
+}
+
+impl LcdSubpixelOrder {
+    /// The RGBA byte (0 = R, 1 = G, 2 = B) that stripe `stripe` (0 = the
+    /// leftmost of the three) of a pixel lights up.
+    #[inline]
+    pub const fn channel(self, stripe: usize) -> usize {
+        match self {
+            Self::Rgb => stripe,
+            Self::Bgr => 2 - stripe,
+        }
+    }
+}
+
 /// Capacity the per-span 5-tap distribution scratch buffer starts at.
 ///
 /// A span is a horizontal run of covered sub-pixels; for text these are
@@ -117,12 +151,28 @@ pub struct PixfmtRgba32Lcd<'a> {
     /// Stripe-space horizontal write window `[x0, x1)`, see
     /// [`Self::set_stripe_clip`].
     stripe_clip: Option<(i32, i32)>,
+    /// Which buffer channel each stripe lands in, see [`LcdSubpixelOrder`].
+    order: LcdSubpixelOrder,
 }
 
 impl<'a> PixfmtRgba32Lcd<'a> {
     /// Create a new LCD pixel format wrapping an RGBA32 rendering buffer.
+    ///
+    /// Renders for an [`LcdSubpixelOrder::Rgb`] panel; see
+    /// [`Self::set_subpixel_order`].
     pub fn new(rbuf: &'a mut RowAccessor, lut: &'a LcdDistributionLut) -> Self {
-        Self { rbuf, lut, c3: Vec::with_capacity(SPAN_SCRATCH), stripe_clip: None }
+        Self {
+            rbuf,
+            lut,
+            c3: Vec::with_capacity(SPAN_SCRATCH),
+            stripe_clip: None,
+            order: LcdSubpixelOrder::Rgb,
+        }
+    }
+
+    /// Render for a panel with the given stripe order.
+    pub fn set_subpixel_order(&mut self, order: LcdSubpixelOrder) {
+        self.order = order;
     }
 
     /// Restrict all writes to the stripe-space window `[x0, x1)`.
@@ -212,7 +262,7 @@ impl<'a> PixelFormat for PixfmtRgba32Lcd<'a> {
         for k in 0..len as usize {
             let sp = x as usize + k;
             let pixel = sp / 3;
-            let channel = sp % 3;
+            let channel = self.order.channel(sp % 3);
             if pixel >= actual_w {
                 break;
             }
@@ -226,7 +276,7 @@ impl<'a> PixelFormat for PixfmtRgba32Lcd<'a> {
     fn blend_pixel(&mut self, x: i32, y: i32, c: &Rgba8, cover: CoverType) {
         let sp = x as usize;
         let pixel = sp / 3;
-        let channel = sp % 3;
+        let channel = self.order.channel(sp % 3);
         let actual_w = self.actual_width() as usize;
         if pixel >= actual_w {
             return;
@@ -263,7 +313,7 @@ impl<'a> PixelFormat for PixfmtRgba32Lcd<'a> {
         for k in 0..len as usize {
             let sp = x as usize + k;
             let pixel = sp / 3;
-            let channel = sp % 3;
+            let channel = self.order.channel(sp % 3);
             if pixel >= actual_w {
                 break;
             }
@@ -366,7 +416,7 @@ impl<'a> PixelFormat for PixfmtRgba32Lcd<'a> {
         for k in 0..remaining {
             let sp = sp_start as usize + k;
             let pixel = sp / 3;
-            let channel = sp % 3;
+            let channel = self.order.channel(sp % 3);
 
             if pixel >= actual_w {
                 break;
@@ -408,7 +458,7 @@ impl<'a> PixelFormat for PixfmtRgba32Lcd<'a> {
         for k in 0..len as usize {
             let sp = x as usize + k;
             let pixel = sp / 3;
-            let channel = sp % 3;
+            let channel = self.order.channel(sp % 3);
             if pixel >= actual_w {
                 break;
             }
@@ -644,6 +694,8 @@ pub struct PixfmtRgba32LcdLinear<'a> {
     /// Stripe-space horizontal write window `[x0, x1)`, see
     /// [`PixfmtRgba32Lcd::set_stripe_clip`].
     stripe_clip: Option<(i32, i32)>,
+    /// Which buffer channel each stripe lands in, see [`LcdSubpixelOrder`].
+    order: LcdSubpixelOrder,
 }
 
 impl<'a> PixfmtRgba32LcdLinear<'a> {
@@ -661,7 +713,14 @@ impl<'a> PixfmtRgba32LcdLinear<'a> {
             cover_lut,
             c3: Vec::with_capacity(SPAN_SCRATCH),
             stripe_clip: None,
+            order: LcdSubpixelOrder::Rgb,
         }
+    }
+
+    /// Render for a panel with the given stripe order; see
+    /// [`PixfmtRgba32Lcd::set_subpixel_order`].
+    pub fn set_subpixel_order(&mut self, order: LcdSubpixelOrder) {
+        self.order = order;
     }
 
     /// Restrict all writes to the stripe-space window `[x0, x1)` — the FIR
@@ -806,7 +865,7 @@ impl<'a> PixelFormat for PixfmtRgba32LcdLinear<'a> {
         for k in 0..len as usize {
             let sp = x as usize + k;
             let pixel = sp / 3;
-            let channel = sp % 3;
+            let channel = self.order.channel(sp % 3);
             if pixel >= actual_w {
                 break;
             }
@@ -820,7 +879,7 @@ impl<'a> PixelFormat for PixfmtRgba32LcdLinear<'a> {
         // Single-stripe blend: gather into a one-pixel composite.
         let sp = x as usize;
         let pixel = sp / 3;
-        let channel = sp % 3;
+        let channel = self.order.channel(sp % 3);
         let actual_w = self.actual_width() as usize;
         if pixel >= actual_w {
             return;
@@ -849,10 +908,10 @@ impl<'a> PixelFormat for PixfmtRgba32LcdLinear<'a> {
                 break;
             }
             let mut cov = [0u32; 3];
-            for ch in 0..3 {
-                let s = pixel * 3 + ch;
+            for stripe in 0..3 {
+                let s = pixel * 3 + stripe;
                 if s >= x as usize && s < sp_end {
-                    cov[ch] = u32::from(cover);
+                    cov[self.order.channel(stripe)] = u32::from(cover);
                 }
             }
             self.composite_pixel(row, pixel, c, u32::from(c.a), cov);
@@ -921,11 +980,11 @@ impl<'a> PixelFormat for PixfmtRgba32LcdLinear<'a> {
             }
             let mut cov = [0u32; 3];
             let mut any = false;
-            for ch in 0..3 {
-                let sp = (pixel * 3 + ch) as i64;
+            for stripe in 0..3 {
+                let sp = (pixel * 3 + stripe) as i64;
                 if sp >= sp_vis_first && sp < sp_vis_last {
                     let v = c3[(sp - sp_first) as usize];
-                    cov[ch] = u32::from(v);
+                    cov[self.order.channel(stripe)] = u32::from(v);
                     any |= v != 0;
                 }
             }
@@ -955,7 +1014,7 @@ impl<'a> PixelFormat for PixfmtRgba32LcdLinear<'a> {
         for k in 0..len as usize {
             let sp = x as usize + k;
             let pixel = sp / 3;
-            let channel = sp % 3;
+            let channel = self.order.channel(sp % 3);
             if pixel >= actual_w {
                 break;
             }
@@ -975,6 +1034,70 @@ impl<'a> PixelFormat for PixfmtRgba32LcdLinear<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Render the same asymmetric coverage run, black on white, for both
+    /// stripe orders through `blend`, and return the two buffers.
+    fn render_both_orders(
+        blend: impl Fn(&mut RowAccessor, LcdSubpixelOrder, &[CoverType]),
+    ) -> (Vec<u8>, Vec<u8>) {
+        // Uneven on purpose: a symmetric run would render identically in
+        // both orders and prove nothing.
+        let covers: [CoverType; 7] = [40, 255, 255, 180, 60, 0, 120];
+        let render = |order| {
+            let (w, h) = (8u32, 1u32);
+            let mut buf = vec![255u8; (w * h * 4) as usize];
+            let mut ra = unsafe { RowAccessor::new_with_buf(buf.as_mut_ptr(), w, h, (w * 4) as i32) };
+            blend(&mut ra, order, &covers);
+            buf
+        };
+        (render(LcdSubpixelOrder::Rgb), render(LcdSubpixelOrder::Bgr))
+    }
+
+    fn assert_bgr_is_rgb_mirrored(rgb: &[u8], bgr: &[u8]) {
+        assert_ne!(rgb, bgr, "the run must light different bytes per order");
+        for (i, (a, b)) in rgb.chunks_exact(4).zip(bgr.chunks_exact(4)).enumerate() {
+            assert_eq!([a[2], a[1], a[0], a[3]], [b[0], b[1], b[2], b[3]], "pixel {i}");
+        }
+    }
+
+    #[test]
+    fn bgr_order_mirrors_the_stripes_of_the_srgb_blend() {
+        let lut = LcdDistributionLut::new(1.0 / 3.0, 2.0 / 9.0, 1.0 / 9.0);
+        let (rgb, bgr) = render_both_orders(|ra, order, covers| {
+            let mut pf = PixfmtRgba32Lcd::new(ra, &lut);
+            pf.set_subpixel_order(order);
+            pf.blend_solid_hspan(4, 0, covers.len() as u32, &Rgba8::new(0, 0, 0, 255), covers);
+        });
+        assert_bgr_is_rgb_mirrored(&rgb, &bgr);
+    }
+
+    #[test]
+    fn bgr_order_mirrors_the_stripes_of_the_linear_blend() {
+        let lut = LcdDistributionLut::new(1.0 / 3.0, 2.0 / 9.0, 1.0 / 9.0);
+        let (rgb, bgr) = render_both_orders(|ra, order, covers| {
+            let mut pf = PixfmtRgba32LcdLinear::new(ra, &lut, LcdBlendParams::default());
+            pf.set_subpixel_order(order);
+            pf.blend_solid_hspan(4, 0, covers.len() as u32, &Rgba8::new(0, 0, 0, 255), covers);
+        });
+        assert_bgr_is_rgb_mirrored(&rgb, &bgr);
+    }
+
+    #[test]
+    fn rgb_is_the_default_order() {
+        // `new` must keep rendering exactly what it rendered before the order
+        // existed, so every existing caller is unaffected.
+        let lut = LcdDistributionLut::new(1.0 / 3.0, 2.0 / 9.0, 1.0 / 9.0);
+        let (default_order, _) = render_both_orders(|ra, _, covers| {
+            let mut pf = PixfmtRgba32Lcd::new(ra, &lut);
+            pf.blend_solid_hspan(4, 0, covers.len() as u32, &Rgba8::new(0, 0, 0, 255), covers);
+        });
+        let (explicit_rgb, _) = render_both_orders(|ra, _, covers| {
+            let mut pf = PixfmtRgba32Lcd::new(ra, &lut);
+            pf.set_subpixel_order(LcdSubpixelOrder::Rgb);
+            pf.blend_solid_hspan(4, 0, covers.len() as u32, &Rgba8::new(0, 0, 0, 255), covers);
+        });
+        assert_eq!(default_order, explicit_rgb);
+    }
 
     #[test]
     fn test_lcd_distribution_lut_construction() {
